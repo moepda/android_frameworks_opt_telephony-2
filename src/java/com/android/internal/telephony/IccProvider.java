@@ -350,7 +350,7 @@ public class IccProvider extends ContentProvider {
         values.put(STR_NEW_NUMBER,"");
         values.put(STR_NEW_EMAILS,"");
         values.put(STR_NEW_ANRS,"");
-        if (efType == FDN && TextUtils.isEmpty(pin2)) {
+        if ((efType == FDN) && TextUtils.isEmpty(pin2)) {
             return 0;
         }
 
@@ -439,7 +439,7 @@ public class IccProvider extends ContentProvider {
             // Load the results
             final int N = adnRecords.size();
             final MatrixCursor cursor = new MatrixCursor(ADDRESS_BOOK_COLUMN_NAMES, N);
-            if (DBG) log("adnRecords.size=" + N);
+            log("adnRecords.size=" + N);
             for (int i = 0; i < N ; i++) {
                 loadRecord(adnRecords.get(i), cursor, i);
             }
@@ -491,8 +491,9 @@ public class IccProvider extends ContentProvider {
             IIccPhoneBook iccIpb = IIccPhoneBook.Stub.asInterface(
                     ServiceManager.getService("simphonebook"));
             if (iccIpb != null) {
-                success = iccIpb.updateAdnRecordsWithContentValuesInEfBySearchUsingSubId(subId,
-                        efType, values, pin2);
+                success = iccIpb
+                        .updateAdnRecordsWithContentValuesInEfBySearchUsingSubId(
+                            subId, efType, values, pin2);
             }
         } catch (RemoteException ex) {
             // ignore it
@@ -540,7 +541,6 @@ public class IccProvider extends ContentProvider {
             String alphaTag = record.getAlphaTag();
             String number = record.getNumber();
             String[] anrs = record.getAdditionalNumbers();
-
             if (DBG) log("loadRecord: " + alphaTag + ", " + Rlog.pii(TAG, number));
             contact[0] = alphaTag;
             contact[1] = number;

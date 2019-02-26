@@ -93,6 +93,8 @@ import com.android.internal.telephony.dataconnection.DataConnectionReasons.DataA
 import com.android.internal.telephony.dataconnection.DataConnectionReasons.DataDisallowedReasonType;
 import com.android.internal.telephony.metrics.TelephonyMetrics;
 import com.android.internal.telephony.uicc.IccRecords;
+import com.android.internal.telephony.uicc.RuimRecords;
+import com.android.internal.telephony.uicc.SIMRecords;
 import com.android.internal.telephony.uicc.UiccController;
 import com.android.internal.util.ArrayUtils;
 import com.android.internal.util.AsyncChannel;
@@ -123,6 +125,7 @@ public class DcTracker extends Handler {
     public AtomicBoolean isCleanupRequired = new AtomicBoolean(false);
 
     private final AlarmManager mAlarmManager;
+    private SIMRecords mSimRecords;
 
     /* Currently requested APN type (TODO: This should probably be a parameter not a member) */
     private String mRequestedApnType = PhoneConstants.APN_TYPE_DEFAULT;
@@ -141,6 +144,8 @@ public class DcTracker extends Handler {
     private static final int POLL_NETSTAT_SCREEN_OFF_MILLIS = 1000*60*10;
     // Default sent packets without ack which triggers initial recovery steps
     private static final int NUMBER_SENT_PACKETS_OF_HANG = 10;
+
+    private static final int EVENT_SIM_RECORDS_LOADED = 100;
 
     // Default for the data stall alarm while non-aggressive stall detection
     private static final int DATA_STALL_ALARM_NON_AGGRESSIVE_DELAY_IN_MS_DEFAULT = 1000 * 60 * 6;
@@ -250,6 +255,7 @@ public class DcTracker extends Handler {
             } else if (action.equals(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED)) {
                 if (mIccRecords.get() != null && mIccRecords.get().getRecordsLoaded()) {
                     setDefaultDataRoamingEnabled();
+                    mDataEnabledSettings.setDefaultMobileDataEnabled();
                 }
             } else {
                 if (DBG) log("onReceive: Unknown action=" + action);
@@ -278,29 +284,31 @@ public class DcTracker extends Handler {
     };
 
     private SubscriptionManager mSubscriptionManager;
-    private final OnSubscriptionsChangedListener mOnSubscriptionsChangedListener =
-            new OnSubscriptionsChangedListener() {
-                public final AtomicInteger mPreviousSubId =
-                        new AtomicInteger(SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+    private final DctOnSubscriptionsChangedListener
+            mOnSubscriptionsChangedListener = new DctOnSubscriptionsChangedListener();
 
-                /**
-                 * Callback invoked when there is any change to any SubscriptionInfo. Typically
-                 * this method invokes {@link SubscriptionManager#getActiveSubscriptionInfoList}
-                 */
-                @Override
-                public void onSubscriptionsChanged() {
-                    if (DBG) log("SubscriptionListener.onSubscriptionInfoChanged");
-                    // Set the network type, in case the radio does not restore it.
-                    int subId = mPhone.getSubId();
-                    if (mSubscriptionManager.isActiveSubId(subId)) {
-                        registerSettingsObserver();
-                    }
-                    if (mPreviousSubId.getAndSet(subId) != subId &&
-                            mSubscriptionManager.isActiveSubId(subId)) {
-                        onRecordsLoadedOrSubIdChanged();
-                    }
-                }
-            };
+    private class DctOnSubscriptionsChangedListener extends OnSubscriptionsChangedListener {
+        public final AtomicInteger mPreviousSubId =
+                new AtomicInteger(SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+
+        /**
+         * Callback invoked when there is any change to any SubscriptionInfo. Typically
+         * this method invokes {@link SubscriptionManager#getActiveSubscriptionInfoList}
+         */
+        @Override
+        public void onSubscriptionsChanged() {
+            if (DBG) log("SubscriptionListener.onSubscriptionInfoChanged");
+            // Set the network type, in case the radio does not restore it.
+            int subId = mPhone.getSubId();
+            if (mSubscriptionManager.isActiveSubId(subId)) {
+                registerSettingsObserver();
+            }
+            if (mSubscriptionManager.isActiveSubId(subId) &&
+                    mPreviousSubId.getAndSet(subId) != subId) {
+                onRecordsLoadedOrSubIdChanged();
+            }
+        }
+    };
 
     private final SettingsObserver mSettingsObserver;
 
@@ -1478,8 +1486,18 @@ public class DcTracker extends Handler {
             apnContext.setConcurrentVoiceAndDataAllowed(mPhone.getServiceStateTracker()
                     .isConcurrentVoiceAndDataAllowed());
             if (apnContext.getState() == DctConstants.State.IDLE) {
+                String requestedApnType = apnContext.getApnType();
+                /*when UICC card is not present, add default emergency apn to apnsettings
+                  only if emergency apn is not present.
+                */
+                if(requestedApnType.equals(PhoneConstants.APN_TYPE_EMERGENCY)){
+                    if(mAllApnSettings == null){
+                        mAllApnSettings = new ArrayList<ApnSetting>();
+                    }
+                    addEmergencyApnSetting();
+                }
                 ArrayList<ApnSetting> waitingApns =
-                        buildWaitingApns(apnContext.getApnType(), radioTech);
+                        buildWaitingApns(requestedApnType, radioTech);
                 if (waitingApns.isEmpty()) {
                     notifyNoData(DcFailCause.MISSING_UNKNOWN_APN, apnContext);
                     notifyOffApnsOfAvailability(apnContext.getReason());
@@ -1571,19 +1589,23 @@ public class DcTracker extends Handler {
             disableMeteredOnly = reason.equals(Phone.REASON_DATA_SPECIFIC_DISABLED) ||
                     reason.equals(Phone.REASON_ROAMING_ON) ||
                     reason.equals(Phone.REASON_CARRIER_ACTION_DISABLE_METERED_APN) ||
+                    reason.equals(Phone.REASON_SINGLE_PDN_ARBITRATION) ||
                     reason.equals(Phone.REASON_PDP_RESET);
         }
 
         for (ApnContext apnContext : mApnContexts.values()) {
             if (disableMeteredOnly) {
-                // Use ApnSetting to decide metered or non-metered.
-                // Tear down all metered data connections.
-                ApnSetting apnSetting = apnContext.getApnSetting();
-                if (apnSetting != null && apnSetting.isMetered(mPhone)) {
-                    if (apnContext.isDisconnected() == false) didDisconnect = true;
-                    if (DBG) log("clean up metered ApnContext Type: " + apnContext.getApnType());
-                    apnContext.setReason(reason);
-                    cleanUpConnection(tearDown, apnContext);
+                if (!apnContext.getApnType().equals(PhoneConstants.APN_TYPE_IMS)) {
+                    // Use ApnSetting to decide metered or non-metered.
+                    // Tear down all metered data connections.
+                    ApnSetting apnSetting = apnContext.getApnSetting();
+                    if (apnSetting != null && apnSetting.isMetered(mPhone)) {
+                            if (apnContext.isDisconnected() == false) didDisconnect = true;
+                            if (DBG) log("clean up metered ApnContext Type: " +
+                                    apnContext.getApnType());
+                            apnContext.setReason(reason);
+                            cleanUpConnection(tearDown, apnContext);
+                    }
                 }
             } else {
                 // Exclude the IMS APN from single DataConenction case.
@@ -2037,8 +2059,8 @@ public class DcTracker extends Handler {
                         // If any call actually requested to be disconnected, means we can't
                         // bring up this connection yet as we need to wait for those data calls
                         // to be disconnected.
-                        if (DBG) log("setupData: Some calls are disconnecting first."
-                                + " Wait and retry");
+                        if (DBG) log("setupData: Some calls are disconnecting first." +
+                                " Wait and retry");
                         return false;
                     }
                 }
@@ -2135,10 +2157,19 @@ public class DcTracker extends Handler {
         if (initialAttachApnSetting == null) {
             if (DBG) log("setInitialAttachApn: X There in no available apn");
         } else {
-            if (DBG) log("setInitialAttachApn: X selected Apn=" + initialAttachApnSetting);
+            String numeric = mPhone.getOperatorNumeric();
+            if (numeric != null &&
+                    !numeric.equalsIgnoreCase(initialAttachApnSetting.numeric)) {
+                if (DBG) log("setInitialAttachApn: use empty apn");
+                //Add empty apn and send attach request
+                initialAttachApnSetting = new ApnSetting(-1, numeric, "", "", "", "",
+                        "", "", "", "", "", 0, new String[]{"ia"}, "IPV4V6", "IPV4V6",
+                        true, 0, 0, 0, false, 0, 0, 0, 0, "", "");
+             }
 
-            mDataServiceManager.setInitialAttachApn(createDataProfile(initialAttachApnSetting),
-                    mPhone.getServiceState().getDataRoamingFromRegistration(), null);
+             if (DBG) log("setInitialAttachApn: X selected Apn=" + initialAttachApnSetting);
+             mDataServiceManager.setInitialAttachApn(createDataProfile(initialAttachApnSetting),
+                      mPhone.getServiceState().getDataRoamingFromRegistration(), null);
         }
     }
 
@@ -2381,6 +2412,9 @@ public class DcTracker extends Handler {
         mAutoAttachOnCreationConfig = false;
         // Clear auto attach as modem is expected to do a new attach once SIM is ready
         mAutoAttachOnCreation.set(false);
+        // Reset previous SUB ID as the same SIM might be inserted back in hot-swap case
+        mOnSubscriptionsChangedListener.mPreviousSubId.set(
+                SubscriptionManager.INVALID_SUBSCRIPTION_ID);
     }
 
     private void onSetDependencyMet(String apnType, boolean met) {
@@ -3580,6 +3614,25 @@ public class DcTracker extends Handler {
         }
 
         apnList = sortApnListByPreferred(apnList);
+
+        if (requestedApnType.equals(PhoneConstants.APN_TYPE_DEFAULT) && mPreferredApn == null) {
+            ApnContext apnContext = mApnContextsById.get(DctConstants.APN_DEFAULT_ID);
+            // If restored to default APN, the APN ID might be changed.
+            // Here reset with the same APN added newly.
+            if (apnContext != null && apnContext.getApnSetting() != null) {
+                for (ApnSetting apnSetting : apnList) {
+                    if (apnSetting.equals(apnContext.getApnSetting(),
+                            mPhone.getServiceState().getDataRoamingFromRegistration())) {
+                        if (DBG) log("buildWaitingApns: reset preferred APN to "
+                                + apnSetting);
+                        mPreferredApn = apnSetting;
+                        setPreferredApn(mPreferredApn.id);
+                        break;
+                    }
+                }
+            }
+        }
+
         if (DBG) log("buildWaitingApns: " + apnList.size() + " APNs in the list: " + apnList);
         return apnList;
     }
@@ -3685,19 +3738,36 @@ public class DcTracker extends Handler {
         return null;
     }
 
+    void onRecordsLoaded() {
+        // If onRecordsLoadedOrSubIdChanged() is not called here, it should be called on
+        // onSubscriptionsChanged() when a valid subId is available.
+        int subId = mPhone.getSubId();
+        if (mSubscriptionManager.isActiveSubId(subId)) {
+            onRecordsLoadedOrSubIdChanged();
+        } else {
+            log("Ignoring EVENT_RECORDS_LOADED as subId is not valid: " + subId);
+        }
+    }
+
     @Override
     public void handleMessage (Message msg) {
         if (VDBG) log("handleMessage msg=" + msg);
 
         switch (msg.what) {
             case DctConstants.EVENT_RECORDS_LOADED:
-                // If onRecordsLoadedOrSubIdChanged() is not called here, it should be called on
-                // onSubscriptionsChanged() when a valid subId is available.
-                int subId = mPhone.getSubId();
-                if (mSubscriptionManager.isActiveSubId(subId)) {
-                    onRecordsLoadedOrSubIdChanged();
+                mSimRecords = mPhone.getSIMRecords();
+                if ((mIccRecords.get() instanceof RuimRecords) && (mSimRecords != null)) {
+                    mSimRecords.registerForRecordsLoaded(this, EVENT_SIM_RECORDS_LOADED, null);
                 } else {
-                    log("Ignoring EVENT_RECORDS_LOADED as subId is not valid: " + subId);
+                    onRecordsLoaded();
+                }
+                break;
+
+            case EVENT_SIM_RECORDS_LOADED:
+                onRecordsLoaded();
+                if (mSimRecords != null) {
+                    mSimRecords.unregisterForRecordsLoaded(this);
+                    mSimRecords = null;
                 }
                 break;
 

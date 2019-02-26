@@ -22,6 +22,7 @@ import android.os.Handler;
 import android.os.IDeviceIdleController;
 import android.os.Looper;
 import android.os.ServiceManager;
+import android.telephony.Rlog;
 import android.telephony.AccessNetworkConstants.TransportType;
 import android.telephony.Rlog;
 

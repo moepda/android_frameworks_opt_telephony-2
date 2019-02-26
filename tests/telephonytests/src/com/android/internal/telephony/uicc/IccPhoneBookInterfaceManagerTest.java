@@ -131,9 +131,9 @@ public class IccPhoneBookInterfaceManagerTest extends TelephonyTest {
                 response.sendToTarget();
                 return null;
             }
-        }).when(mAdnRecordCache).updateAdnBySearch(anyInt(),
-                (AdnRecord) anyObject(), (AdnRecord) anyObject(),
-                anyString(), (Message) anyObject());
+        }).when(mAdnRecordCache).updateAdnBySearch(
+            anyInt(), (AdnRecord) anyObject(), (AdnRecord) anyObject(),
+            anyString(), (Message) anyObject());
 
         ContentValues values = new ContentValues();
         values.put("tag", "");
@@ -146,7 +146,7 @@ public class IccPhoneBookInterfaceManagerTest extends TelephonyTest {
         values.put("newAnrs", "");
 
         boolean result = mIccPhoneBookInterfaceMgr.updateAdnRecordsWithContentValuesInEfBySearch(
-                IccConstants.EF_ADN, values , null);
+                IccConstants.EF_ADN, values , "1234");
 
         assertTrue(result);
     }
